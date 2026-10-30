@@ -1,0 +1,215 @@
+# Diccionario de datos · ControlDiesel-Net
+
+Base de datos: PostgreSQL · Fuente: DER v4 (`docs/`) y propuesta v4.
+Este documento es la referencia para escribir `db/01_schema.sql`, los modelos de SQLAlchemy y las pruebas.
+
+## 1. Convenciones
+
+| Tema | Decisión | Por qué |
+| --- | --- | --- |
+| Nombres | Tablas y columnas en `snake_case`, minúsculas, sin tildes. | Evita comillas y problemas de codificación en SQL. |
+| Claves primarias | `INT GENERATED ALWAYS AS IDENTITY` (excepto `alerta_despacho`, clave compuesta). | Estándar actual de PostgreSQL; evita insertar ids a mano. |
+| Litros y saldos | `NUMERIC(12,2)`, nunca `FLOAT`. | El saldo debe ser exacto; los decimales binarios acumulan error. |
+| Fechas y horas | Instantes en `TIMESTAMPTZ` (se guardan en UTC); vigencias en `DATE`. | Las ventanas de 12 h y 24 h dependen de una referencia horaria única. Se convierte a hora de La Paz solo al mostrar. |
+| Extremos de vigencia | Inclusivos: `fecha_inicio` y `fecha_fin` cuentan como vigentes. | Regla RN-07. |
+| Baja | Lógica, con la columna `activo`. No se borra físicamente. | Conserva la trazabilidad y las claves foráneas. |
+| Textos con valores fijos | `VARCHAR` con `CHECK (... IN (...))`. | Más simple de cambiar que un tipo `ENUM` y deja el error claro. |
+| Secretos | Solo `password_hash` (bcrypt). Nunca se guarda ni se registra la contraseña. | RNF-02. |
+
+## 2. Valores permitidos
+
+| Campo | Valores |
+| --- | --- |
+| `cupos.estado` | `PENDIENTE` (fecha de inicio futura) · `VIGENTE` (hoy dentro del periodo) · `VENCIDO` (fecha de fin pasada) |
+| `despachos.estado` | `CONFIRMADO` (único estado; no hay anulación en esta versión) |
+| `alertas.tipo` | `RD-01` · `RD-02` |
+| `alertas.estado` | `PENDIENTE` → `EN_REVISION` → `CERRADA`. Abiertas: `PENDIENTE` y `EN_REVISION`. |
+| `revisiones_alerta.resultado` | `JUSTIFICADA` · `REQUIERE_SEGUIMIENTO` (obligatorio al pasar a `CERRADA`) |
+| `auditoria.resultado` | `EXITO` · `RECHAZADO` · `ERROR` |
+| `auditoria.accion` | `LOGIN`, `LOGIN_FALLIDO`, `DESPACHO_CONFIRMADO`, `DESPACHO_RECHAZADO`, `CUPO_CREADO`, `CUPO_MODIFICADO`, `ALERTA_REVISADA`, `ALERTA_CERRADA`, `USUARIO_CREADO`, `USUARIO_DESACTIVADO` (se pueden agregar más) |
+| `roles.nombre` | `Administrador` · `Operador` · `Regulador` (fijos, cargados como datos semilla) |
+
+## 3. Entidades
+
+Leyenda: **PK** clave primaria · **FK** clave foránea · **UQ** único · **NN** no nulo.
+
+### 3.1 `roles`
+Los tres roles fijos del sistema. No hay CRUD de roles.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_rol` | INT | PK | Identificador. |
+| `nombre` | VARCHAR(30) | UQ, NN | Nombre del rol. |
+| `descripcion` | VARCHAR(150) | | Qué puede hacer el rol. |
+
+### 3.2 `estaciones`
+Estaciones de servicio donde se registran los despachos.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_estacion` | INT | PK | Identificador. |
+| `codigo` | VARCHAR(20) | UQ, NN | Código único de la estación. |
+| `nombre` | VARCHAR(100) | NN | Nombre. |
+| `ubicacion` | VARCHAR(200) | | Dirección o zona (opcional). |
+| `activo` | BOOLEAN | NN, por defecto `TRUE` | Baja lógica. |
+
+### 3.3 `usuarios`
+Personas que acceden al sistema.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_usuario` | INT | PK | Identificador. |
+| `id_rol` | INT | FK → `roles`, NN | Rol del usuario. |
+| `id_estacion` | INT | FK → `estaciones`, opcional | Estación asignada. **Obligatoria solo para Operadores.** |
+| `nombre` | VARCHAR(100) | NN | Nombre completo. |
+| `email` | VARCHAR(150) | UQ, NN | Correo; se usa para iniciar sesión. |
+| `password_hash` | VARCHAR(255) | NN | Hash bcrypt de la contraseña. |
+| `activo` | BOOLEAN | NN, por defecto `TRUE` | Baja lógica; un usuario inactivo no puede iniciar sesión. |
+
+### 3.4 `vehiculos`
+Vehículos que reciben cupos.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_vehiculo` | INT | PK | Identificador. |
+| `placa` | VARCHAR(15) | UQ, NN | Placa única. |
+| `descripcion` | VARCHAR(100) | | Marca, modelo o tipo (opcional). |
+| `activo` | BOOLEAN | NN, por defecto `TRUE` | Baja lógica; un vehículo inactivo no recibe nuevas operaciones. |
+
+### 3.5 `cupos`
+Litros autorizados a un vehículo durante un periodo. Es la tabla que se bloquea durante el despacho.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_cupo` | INT | PK | Identificador. |
+| `id_vehiculo` | INT | FK → `vehiculos`, NN | Vehículo beneficiario. |
+| `cantidad_autorizada` | NUMERIC(12,2) | NN, `CHECK > 0` | Litros asignados al periodo. |
+| `saldo_disponible` | NUMERIC(12,2) | NN, `CHECK 0 ≤ saldo ≤ cantidad_autorizada` | Litros que aún se pueden despachar. Se modifica **solo** dentro de la transacción de despacho. |
+| `fecha_inicio` | DATE | NN | Primer día de vigencia (incluido). |
+| `fecha_fin` | DATE | NN, `CHECK fecha_inicio ≤ fecha_fin` | Último día de vigencia (incluido). |
+| `estado` | VARCHAR(20) | NN, `CHECK IN` (ver §2) | Estado derivado de las fechas. |
+
+Restricciones de tabla:
+- **Sin solapamiento:** `EXCLUDE USING gist (id_vehiculo WITH =, daterange(fecha_inicio, fecha_fin, '[]') WITH &&) WHERE (estado IN ('PENDIENTE','VIGENTE'))`. Requiere la extensión `btree_gist`.
+- **Consumido** = `cantidad_autorizada − saldo_disponible` (se calcula, no se guarda).
+
+### 3.6 `despachos`
+Despachos **confirmados**. Los intentos rechazados no se guardan aquí.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_despacho` | INT | PK | Identificador. |
+| `id_cupo` | INT | FK → `cupos`, NN | Cupo del que se descuenta. El vehículo se obtiene por este cupo. |
+| `id_estacion` | INT | FK → `estaciones`, NN | Estación donde se despachó (la del Operador, no la enviada por el navegador). |
+| `id_usuario` | INT | FK → `usuarios`, NN | Operador que registró el despacho. |
+| `cantidad` | NUMERIC(12,2) | NN, `CHECK > 0` | Litros despachados. |
+| `fecha_hora` | TIMESTAMPTZ | NN, por defecto `now()` | Momento del despacho; referencia de RD-01 y RD-02. |
+| `estado` | VARCHAR(20) | NN, por defecto `'CONFIRMADO'`, `CHECK IN` | Único valor: `CONFIRMADO`. |
+
+Índices sugeridos: `(id_cupo, fecha_hora)` para las ventanas de reglas y `(id_estacion, fecha_hora)` para reportes.
+
+### 3.7 `alertas`
+Alertas de revisión generadas por RD-01 y RD-02. RD-03 **no** genera alertas.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_alerta` | INT | PK | Identificador. |
+| `id_vehiculo` | INT | FK → `vehiculos`, NN | Vehículo que originó la alerta. |
+| `tipo` | VARCHAR(10) | NN, `CHECK IN ('RD-01','RD-02')` | Regla que la generó. |
+| `estado` | VARCHAR(20) | NN, por defecto `'PENDIENTE'`, `CHECK IN` | Ciclo de vida de la revisión. |
+| `descripcion` | TEXT | | Texto descriptivo del patrón detectado. |
+| `fecha_creacion` | TIMESTAMPTZ | NN, por defecto `now()` | Cuándo se creó. |
+| `fecha_ultima` | TIMESTAMPTZ | NN | Última vez que la regla volvió a cumplirse. |
+| `contador` | INT | NN, por defecto `1`, `CHECK ≥ 1` | Cuántas veces se cumplió la regla mientras estuvo abierta. |
+
+Restricción de tabla: **una sola alerta abierta por vehículo y tipo**, con un índice único parcial:
+`CREATE UNIQUE INDEX ... ON alertas (id_vehiculo, tipo) WHERE estado IN ('PENDIENTE','EN_REVISION');`
+
+### 3.8 `alerta_despacho`
+Evidencia: qué despachos sustentan cada alerta.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_alerta` | INT | PK (compuesta), FK → `alertas` | Alerta. |
+| `id_despacho` | INT | PK (compuesta), FK → `despachos` | Despacho que la sustenta. |
+
+### 3.9 `revisiones_alerta`
+Historial de cambios de estado de una alerta.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_revision` | INT | PK | Identificador. |
+| `id_alerta` | INT | FK → `alertas`, NN | Alerta revisada. |
+| `id_usuario` | INT | FK → `usuarios`, NN | Regulador que hizo el cambio. |
+| `estado_anterior` | VARCHAR(20) | NN | Estado antes del cambio. |
+| `estado_nuevo` | VARCHAR(20) | NN | Estado después del cambio. |
+| `observaciones` | TEXT | | Comentario del Regulador. |
+| `resultado` | VARCHAR(100) | `CHECK IN` (§2) | `JUSTIFICADA` o `REQUIERE_SEGUIMIENTO`; obligatorio cuando `estado_nuevo = 'CERRADA'`. |
+| `fecha_hora` | TIMESTAMPTZ | NN, por defecto `now()` | Cuándo se hizo el cambio. |
+
+### 3.10 `auditoria`
+Registro de acciones críticas, incluidos los **intentos de despacho rechazados** (RD-03).
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `id_auditoria` | INT | PK | Identificador. |
+| `id_usuario` | INT | FK → `usuarios`, opcional | Quién actuó. Nulo si no hay usuario (por ejemplo, un login con correo inexistente). |
+| `accion` | VARCHAR(100) | NN | Qué ocurrió (ver §2). |
+| `entidad` | VARCHAR(50) | NN | Tabla o recurso afectado (`despachos`, `cupos`, `alertas`, ...). |
+| `id_registro` | INT | | Id del registro afectado. **Sin clave foránea**: apunta a distintas tablas según `entidad`. |
+| `resultado` | VARCHAR(40) | NN, `CHECK IN` (§2) | Éxito, rechazo o error. |
+| `fecha_hora` | TIMESTAMPTZ | NN, por defecto `now()` | Cuándo ocurrió. |
+| `detalle` | TEXT | | Información útil **no sensible**: vehículo, litros solicitados, motivo (por ejemplo, `SALDO_INSUFICIENTE`). Nunca contraseñas ni tokens. |
+
+### 3.11 `solicitudes_despacho` (extensión RF-12 — no está en el DER base)
+Solo se crea si se implementa la idempotencia.
+
+| Columna | Tipo | Restricciones | Descripción |
+| --- | --- | --- | --- |
+| `clave_solicitud` | UUID | PK | Clave generada por el cliente antes del primer envío. |
+| `huella_carga` | VARCHAR(64) | NN | Hash del contenido de la solicitud, para detectar reuso con otra carga. |
+| `resultado` | VARCHAR(40) | NN | Resultado devuelto la primera vez. |
+| `id_despacho` | INT | FK → `despachos`, opcional | Despacho creado, si lo hubo. |
+| `fecha_hora` | TIMESTAMPTZ | NN, por defecto `now()` | Cuándo se recibió. |
+
+## 4. Relaciones
+
+| Relación | Cardinalidad | Significado |
+| --- | --- | --- |
+| `roles` — `usuarios` | 1 : N | Un rol lo tienen muchos usuarios. |
+| `estaciones` — `usuarios` | 1 : N (opcional) | Una estación puede tener varios Operadores asignados. |
+| `vehiculos` — `cupos` | 1 : N | Un vehículo recibe cupos en distintos periodos. |
+| `cupos` — `despachos` | 1 : N | De un cupo se descuentan muchos despachos. |
+| `estaciones` — `despachos` | 1 : N | Una estación registra muchos despachos. |
+| `usuarios` — `despachos` | 1 : N | Un Operador registra muchos despachos. |
+| `vehiculos` — `alertas` | 1 : N | Un vehículo puede originar varias alertas (una abierta por tipo). |
+| `alertas` — `despachos` | N : M (vía `alerta_despacho`) | Una alerta se sustenta en varios despachos y un despacho puede estar en varias alertas. |
+| `alertas` — `revisiones_alerta` | 1 : N | Historial de revisiones de una alerta. |
+| `usuarios` — `revisiones_alerta` | 1 : N | Un Regulador hace muchas revisiones. |
+| `usuarios` — `auditoria` | 1 : N (opcional) | Acciones registradas por usuario. |
+
+## 5. Reglas que la base de datos no puede garantizar sola
+
+Un `CHECK` o una clave foránea no ven otras tablas. Estas reglas se aplican en el **servicio** (backend) y se cubren con pruebas:
+
+| Regla | Dónde se aplica | Prueba |
+| --- | --- | --- |
+| Un usuario con rol Operador debe tener `id_estacion`. | Servicio de usuarios. | P03, P20 |
+| `despachos.id_estacion` debe ser la estación asignada al Operador (`usuarios.id_estacion`). | Servicio de despacho. | P08 |
+| El despacho solo procede si el cupo está vigente **por fechas** y el saldo alcanza; se comprueba de nuevo dentro de la transacción con el cupo bloqueado. | Servicio de despacho. | P05, P06, P07, P09 |
+| `saldo_disponible` debe coincidir con `cantidad_autorizada` menos la suma de despachos confirmados. | Servicio de despacho (descuento en la misma transacción). | P05, P18 |
+| La cantidad autorizada de un cupo no puede reducirse por debajo de lo ya consumido. | Servicio de cupos. | P14 |
+| Al pasar una alerta a `CERRADA` debe haber `resultado` y observación. | Servicio de alertas. | P13 |
+| Los datos de `auditoria.detalle` no contienen información sensible. | Servicio de auditoría. | Revisión manual |
+
+> **Nota sobre `cupos.estado`:** la validación del despacho usa las **fechas**, no solo el campo `estado`. Así, un cupo que venció a medianoche se rechaza aunque el campo aún no se haya actualizado.
+
+## 6. Datos semilla mínimos (`02_seed.sql`)
+
+| Tabla | Cantidad | Contenido |
+| --- | --- | --- |
+| `roles` | 3 | Administrador, Operador, Regulador. |
+| `estaciones` | 2–3 | Códigos y nombres ficticios. |
+| `vehiculos` | 5–6 | Placas ficticias. |
+| `usuarios` | 4 | 1 Administrador, 1 Regulador, 2 Operadores (cada uno con estación distinta). |
+| `cupos` | 1 por vehículo | Vigentes, con saldos suficientes para las pruebas. |
