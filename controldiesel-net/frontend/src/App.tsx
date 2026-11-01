@@ -1,6 +1,8 @@
 
 import { useEffect, useState } from "react";
 import Login from "./pages/Login";
+import Despachos from "./pages/Despachos";
+import Cupos from "./pages/Cupos";
 import { clearToken, getToken } from "./services/api";
 import { me } from "./services/auth";
 import type { Usuario } from "./types";
@@ -68,6 +70,7 @@ export default function App() {
             <li>Gestión de estaciones</li>
             <li>Gestión de vehículos</li>
             <li>Auditoría del sistema</li>
+            <li>Gestión de cupos</li>
           </ul>
         )}
 
@@ -88,6 +91,10 @@ export default function App() {
           </ul>
         )}
       </section>
+
+      {usuario.rol === "Administrador" && <Cupos />}
+
+      {usuario.rol === "Operador" && <Despachos />}
     </main>
   );
 }
